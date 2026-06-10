@@ -70,7 +70,7 @@ async def start(update: Update, context: CallbackContext):
     await register_user_start(user_id, referral_code)
     await update.message.reply_text(
         "🎬 **Kino botiga xush kelibsiz!**\n"
-        "📣 Kino kanalimiz: @kino\\_boru\n\n"
+        "📣 Kino kanalimiz: @kino\\_kanal\\_u7bek\n\n"
         "Film kodini raqamlarda yuboring.\n"
         "Admin: /admin",
         parse_mode="Markdown"
@@ -384,8 +384,8 @@ async def handle_code(update: Update, context: CallbackContext):
 
         # Videodan keyin avtomatik havolalar
         links_msg = (
-            "📱 Instagram: https://instagram.com/Bear_uzb070\n"
-            "📣 Kino kanal: @kino_boru"
+            "📱 Instagram: https://instagram.com/kino_kanal_uzbek\n"
+            "📣 Kino kanal: @kino_kanal_u7bek"
         )
         await update.message.reply_text(links_msg)
 
