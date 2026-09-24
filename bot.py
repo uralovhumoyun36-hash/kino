@@ -22,10 +22,20 @@ from database import (
     set_ad, get_ad, remove_ad, increment_ad_count,
     get_active_mandatory_subs, is_user_completed_sub, mark_user_completed_sub,
     add_mandatory_subscription, remove_mandatory_subscription, list_mandatory_subscriptions,
-    set_user_completed_sub
+    set_user_completed_sub, get_user_referral_count
 )
 
 load_dotenv()
+
+# ======================== Doimiy majburiy obuna ========================
+PERMANENT_MANDATORY_SUBS = [
+    {
+        "type": "telegram",
+        "identifier": "@mpmpmpmp33",
+        "limit": 999999,
+        "chat_id": None
+    }
+]
 
 # ======================== Holatlar ========================
 WAITING_FOR_VIDEO, WAITING_FOR_CUSTOM_CODE, WAITING_FOR_DESCRIPTION = range(3)
@@ -39,6 +49,11 @@ RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 if not RENDER_EXTERNAL_HOSTNAME:
     raise ValueError("RENDER_EXTERNAL_HOSTNAME topilmadi")
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
+
+# ======================== Bot sozlamalari ========================
+BOT_USERNAME = "Kino_kanal_uzbekbot"  # @ belgisisiz
+CHANNEL_USERNAME = "@kino_kanal_u7bek"  # Kanal username
+CHANNEL_URL = "https://t.me/kino_kanal_u7bek"  # Kanal URL
 
 # ======================== Reklama ========================
 async def send_ad(bot, chat_id):
@@ -75,20 +90,15 @@ async def check_telegram_membership(bot, user_id, sub_data):
     try:
         chat_id = None
         
-        # Avval chat_id bo'lsa (zayafka yoki yopiq guruh uchun)
         if sub_data.get("chat_id"):
             chat_id = sub_data["chat_id"]
         else:
             identifier = sub_data["identifier"]
             
-            # @username formatida
             if identifier.startswith("@"):
                 chat_id = identifier
-            
-            # https://t.me/ formatida
             elif "t.me/" in identifier:
                 if "t.me/+" in identifier or "joinchat" in identifier:
-                    # Zayafka link - chat_id yo'q bo'lsa, linkdan chat olishga harakat qilamiz
                     try:
                         chat = await bot.get_chat(identifier)
                         chat_id = chat.id
@@ -96,19 +106,15 @@ async def check_telegram_membership(bot, user_id, sub_data):
                         print(f"Zayafka linkdan chat olishda xatolik: {e}")
                         return None
                 else:
-                    # Oddiy link - usernameni olamiz
                     parts = identifier.split("/")
                     if len(parts) >= 2:
                         chat_id = "@" + parts[-1]
-            
-            # Faqat username berilgan
             else:
                 chat_id = "@" + identifier.lstrip("@")
         
         if not chat_id:
             return None
         
-        # A'zolikni tekshirish
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         return member.status in ["member", "administrator", "creator"]
         
@@ -124,7 +130,6 @@ async def show_mandatory_subs(update: Update, context: CallbackContext):
     if not subs:
         return True
 
-    # Faqat bajarilmaganlarini olamiz
     incomplete = []
     for sub in subs:
         is_completed = await is_user_completed_sub(user_id, sub["id"])
@@ -141,10 +146,8 @@ async def show_mandatory_subs(update: Update, context: CallbackContext):
         sub_type = sub["type"]
         identifier = sub["identifier"]
         
-        # HAMMASI BIR XIL - faqat raqam va "kanal"
         button_text = f"📢 {idx}-kanal"
         
-        # Havola tayyorlash
         if sub_type in ("telegram", "group"):
             if identifier.startswith("@"):
                 url = f"https://t.me/{identifier[1:]}"
@@ -316,10 +319,11 @@ async def start_after_subs(update: Update, context: CallbackContext):
         message = update.message
 
     await message.reply_text(
-        "🎬 Kino botiga xush kelibsiz!\n"
-        "📣 Kino kanalimiz: @kino_kanal_u7bek\n\n"
-        "Film kodini raqamlarda yuboring.\n"
-        "Admin: /admin"
+        f"🎬 Kino botiga xush kelibsiz!\n"
+        f"📣 Kino kanalimiz: {CHANNEL_USERNAME}\n\n"
+        f"Film kodini raqamlarda yuboring.\n"
+        f"Admin: /admin\n\n"
+        f"🔗 /referral - referal havolangiz va statistikangiz"
     )
     asyncio.create_task(send_ad(context.bot, user_id))
 
@@ -336,6 +340,33 @@ async def start(update: Update, context: CallbackContext):
     await start_after_subs(update, context)
 
 
+# ======================== Referal (foydalanuvchi uchun) ========================
+async def referral(update: Update, context: CallbackContext):
+    """Foydalanuvchi o'zining referal havolasini va statistikasini ko'radi"""
+    user_id = update.effective_user.id
+    
+    if await check_and_handle_mandatory_subs(update, context):
+        return
+    
+    # Foydalanuvchi qancha odam qo'shgan
+    count = await get_user_referral_count(user_id)
+    
+    refer_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+    
+    text = (
+        f"🔗 <b>Sizning referal havolangiz:</b>\n"
+        f"<code>{refer_link}</code>\n\n"
+        f"👥 <b>Umumiy qo'shgan odamlaringiz:</b> {count} ta\n\n"
+        f"<i>Havolani do'stlaringizga yuboring va botga qo'shilingan har bir do'stingiz hisoblanadi!</i>"
+    )
+    
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+
 # ======================== Admin panel ========================
 async def admin(update: Update, context: CallbackContext):
     if update.effective_user.id != ADMIN_ID:
@@ -350,6 +381,7 @@ async def admin(update: Update, context: CallbackContext):
         "/broadcast - obunachilarga xabar\n"
         "/createref - referal havola yaratish\n"
         "/refstats - referallar statistikasi\n"
+        "/userref &lt;user_id&gt; - foydalanuvchi referallari\n"
         "/setad - reklama o'rnatish\n"
         "/removead - reklamani o'chirish\n"
         "/adstats - reklama statistikasi\n\n"
@@ -369,6 +401,39 @@ async def admin(update: Update, context: CallbackContext):
         "/add_mandatory bot @kinobot 3000\n\n"
         "/remove_mandatory &lt;id&gt; - o'chirish\n"
         "/list_mandatory - ro'yxat",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+
+# ======================== Foydalanuvchi referallarini ko'rish (admin) ========================
+async def userref(update: Update, context: CallbackContext):
+    """Admin foydalanuvchining referallarini ko'radi"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("📛 Foydalanuvchi ID sini kiriting: /userref 123456789")
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Noto'g'ri ID formati.")
+        return
+    
+    count = await get_user_referral_count(target_user_id)
+    
+    refer_link = f"https://t.me/{BOT_USERNAME}?start={target_user_id}"
+    
+    text = (
+        f"🔗 <b>Foydalanuvchi {target_user_id} referal havolasi:</b>\n"
+        f"<code>{refer_link}</code>\n\n"
+        f"👥 <b>Umumiy qo'shgan odamlari:</b> {count} ta"
+    )
+    
+    await update.message.reply_text(
+        text,
         parse_mode="HTML",
         disable_web_page_preview=True
     )
@@ -515,7 +580,7 @@ async def listvideos(update: Update, context: CallbackContext):
     await update.message.reply_text(text)
 
 
-# ======================== Referal ========================
+# ======================== Referal (admin) ========================
 async def createref_start(update: Update, context: CallbackContext):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
@@ -530,13 +595,12 @@ async def createref_get_name(update: Update, context: CallbackContext):
     if not name:
         await update.message.reply_text("❌ Bo'sh bo'lmagan nom kiriting.")
         return WAITING_REF_NAME
-    bot_username = "KINO_bor_botbot"
     while True:
         code = secrets.token_hex(3)
         if not await check_referral_code(code):
             break
     await create_referral(name, code)
-    link = f"https://t.me/{bot_username}?start={code}"
+    link = f"https://t.me/{BOT_USERNAME}?start={code}"
     await update.message.reply_text(
         f"✅ Yangi referal havola yaratildi\n\n"
         f"📌 Nomi: {name}\n"
@@ -664,6 +728,15 @@ async def remove_mandatory(update: Update, context: CallbackContext):
         await update.message.reply_text("Ishlatish: /remove_mandatory <id>")
         return
     sub_id = int(context.args[0])
+    
+    # Doimiy majburiy obunani o'chirishni taqiqlash
+    permanent_identifiers = [s["identifier"] for s in PERMANENT_MANDATORY_SUBS]
+    rows = await list_mandatory_subscriptions()
+    for r in rows:
+        if r["id"] == sub_id and r["identifier"] in permanent_identifiers:
+            await update.message.reply_text("⛔ Bu doimiy majburiy obuna, o'chirib bo'lmaydi!")
+            return
+    
     await remove_mandatory_subscription(sub_id)
     await update.message.reply_text(f"✅ ID {sub_id} o'chirildi.")
 
@@ -719,8 +792,8 @@ async def handle_code(update: Update, context: CallbackContext):
             await update.message.reply_text("❌ Video yuborishda xatolik yuz berdi.")
             return
         links_msg = (
-            "📱 Instagram: https://instagram.com/Kino_kanal_uzbek\n"
-            "📣 Kino kanal: @kino_kanal_u7bek"
+            f"📱 Instagram: https://instagram.com/Kino_kanal_uzbek\n"
+            f"📣 Kino kanal: @kino_kanal_u7bek {CHANNEL_USERNAME}"
         )
         await update.message.reply_text(links_msg)
         await send_ad(context.bot, user_id)
@@ -747,6 +820,19 @@ bot_application = None
 async def main():
     global bot_application
     await init_db()
+    
+    # ======================== Doimiy majburiy obunani qo'shish ========================
+    existing_subs = await list_mandatory_subscriptions()
+    existing_identifiers = [s["identifier"] for s in existing_subs]
+    for sub in PERMANENT_MANDATORY_SUBS:
+        if sub["identifier"] not in existing_identifiers:
+            await add_mandatory_subscription(
+                sub["type"], sub["identifier"], sub["limit"], sub["chat_id"]
+            )
+            print(f"✅ Doimiy obuna qo'shildi: {sub['identifier']}")
+        else:
+            print(f"ℹ️ Doimiy obuna allaqachon mavjud: {sub['identifier']}")
+    
     bot_application = Application.builder().token(BOT_TOKEN).build()
 
     private_filter = filters.ChatType.PRIVATE
@@ -757,6 +843,8 @@ async def main():
     bot_application.add_handler(CommandHandler("delvideo", delvideo, filters=private_filter))
     bot_application.add_handler(CommandHandler("list", listvideos, filters=private_filter))
     bot_application.add_handler(CommandHandler("refstats", refstats, filters=private_filter))
+    bot_application.add_handler(CommandHandler("referral", referral, filters=private_filter))
+    bot_application.add_handler(CommandHandler("userref", userref, filters=private_filter))
     bot_application.add_handler(CommandHandler("removead", removead, filters=private_filter))
     bot_application.add_handler(CommandHandler("adstats", adstats, filters=private_filter))
     bot_application.add_handler(CommandHandler("cancel", cancel, filters=private_filter))
