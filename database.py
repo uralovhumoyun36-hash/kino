@@ -66,7 +66,7 @@ async def init_db():
             )
         ''')
 
-        # ESKI JADVALGA chat_id QO'SHISH
+        # chat_id QO'SHISH
         try:
             await conn.execute('''
                 ALTER TABLE mandatory_subscriptions 
@@ -105,6 +105,20 @@ async def register_user_start(user_id, referral_code=None):
                     "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = $1",
                     user_id
                 )
+
+
+async def get_user_referral_count(user_id):
+    """Foydalanuvchi qancha odam qo'shganini qaytaradi"""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referred_by = $1::text",
+            str(user_id)
+        )
+        ref_count = await conn.fetchval(
+            "SELECT COALESCE(SUM(count), 0) FROM referrals WHERE code = $1::text",
+            str(user_id)
+        )
+        return count + ref_count
 
 
 async def get_total_users():
