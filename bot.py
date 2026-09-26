@@ -41,26 +41,19 @@ if not RENDER_EXTERNAL_HOSTNAME:
 WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 
-# ======================== 🔥 MIDDLEWARE: Har qanday xabarda foydalanuvchini ro'yxatdan o'tkazish ========================
+# ======================== 🔥 MIDDLEWARE ========================
 async def track_user_middleware(update: Update, context: CallbackContext):
-    """
-    Eng birinchi ishlaydigan handler.
-    Har qanday xabar/callback da foydalanuvchini bazaga qo'shadi yoki aktivligini yangilaydi.
-    """
     try:
         user = update.effective_user
         chat = update.effective_chat
         if not user or not chat:
             return
-        # Faqat shaxsiy chatlar
         if chat.type != "private":
             return
-        # Botlarni hisobga olmaymiz
         if user.is_bot:
             return
 
         user_id = user.id
-        # register_user_start: agar mavjud bo'lmasa qo'shadi, mavjud bo'lsa last_activity yangilaydi
         await register_user_start(user_id)
     except Exception as e:
         print(f"Middleware xatolik: {e}")
@@ -105,17 +98,18 @@ async def check_telegram_membership(bot, user_id, sub_data):
             chat_id = sub_data["chat_id"]
         else:
             identifier = sub_data["identifier"]
+            sub_type = sub_data.get("type")
+
+            # ✅ Invite linklar uchun chat_id majburiy
+            if sub_type == "invite":
+                print(f"⚠️ Invite link uchun chat_id kerak: {identifier}")
+                return None
 
             if identifier.startswith("@"):
                 chat_id = identifier
             elif "t.me/" in identifier:
                 if "t.me/+" in identifier or "joinchat" in identifier:
-                    try:
-                        chat = await bot.get_chat(identifier)
-                        chat_id = chat.id
-                    except Exception as e:
-                        print(f"Zayafka linkdan chat olishda xatolik: {e}")
-                        return None
+                    return None
                 else:
                     parts = identifier.split("/")
                     if len(parts) >= 2:
@@ -181,15 +175,24 @@ async def show_mandatory_subs(update: Update, context: CallbackContext):
     confirm_button = [[InlineKeyboardButton("✅ Obuna bo'ldim", callback_data="confirm_all_subs")]]
     reply_markup = InlineKeyboardMarkup(url_buttons + confirm_button)
 
+    # Eski xabarni o'chirish
     if "mandatory_msg_id" in context.user_data:
         try:
             await context.bot.delete_message(chat_id=user_id, message_id=context.user_data["mandatory_msg_id"])
-        except:
+        except Exception:
             pass
 
-    sent_msg = await update.message.reply_text(
-        text, reply_markup=reply_markup, parse_mode="HTML", disable_web_page_preview=True
-    )
+    # ✅ Callback va message ikkalasi uchun ishlaydi
+    if update.callback_query:
+        sent_msg = await context.bot.send_message(
+            chat_id=user_id, text=text, reply_markup=reply_markup,
+            parse_mode="HTML", disable_web_page_preview=True
+        )
+    else:
+        sent_msg = await update.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode="HTML", disable_web_page_preview=True
+        )
+
     context.user_data["mandatory_msg_id"] = sent_msg.message_id
     return False
 
@@ -203,7 +206,7 @@ async def check_and_handle_mandatory_subs(update: Update, context: CallbackConte
     current_time = time.time()
 
     if cache_time_key in context.user_data:
-        if current_time - context.user_data[cache_time_key] < 30:
+        if current_time - context.user_data[cache_time_key] < 10:
             if context.user_data.get(cache_key, False):
                 await show_mandatory_subs(update, context)
                 return True
@@ -234,6 +237,7 @@ async def check_and_handle_mandatory_subs(update: Update, context: CallbackConte
             else:
                 return (sub, already_completed)
         else:
+            # ✅ Instagram/YouTube/website — faqat "Obuna bo'ldim" bosilganda True
             return (sub, already_completed)
 
     results = await asyncio.gather(*[check_sub(sub) for sub in subs])
@@ -265,12 +269,17 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
         await start_after_subs(update, context)
         return
 
+    sub_positions = {s["id"]: i for i, s in enumerate(subs, start=1)}
+
     still_incomplete = []
     for sub in subs:
         if not await is_user_completed_sub(user_id, sub["id"]):
             still_incomplete.append(sub)
 
     if not still_incomplete:
+        context.user_data.pop("sub_check_cache", None)
+        context.user_data.pop("sub_check_time", None)
+        context.user_data.pop("mandatory_msg_id", None)
         await query.edit_message_text("✅ Barcha kanallarga obuna bo'lgansiz!")
         await start_after_subs(update, context)
         return
@@ -280,18 +289,14 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
     async def check_single_sub(sub):
         if sub["type"] in telegram_types:
             result = await check_telegram_membership(context.bot, user_id, sub)
-            # ✅ TUZATILDI: None = xatolik = a'zo emas deb hisoblaymiz
             if result is None:
                 return (sub, False)
             return (sub, result)
         else:
+            # ✅ Instagram/YouTube/website — "Obuna bo'ldim" bosgani uchun True
             return (sub, True)
 
     results = await asyncio.gather(*[check_single_sub(sub) for sub in still_incomplete])
-
-    sub_positions = {}
-    for i, s in enumerate(subs, start=1):
-        sub_positions[s["id"]] = i
 
     failed = []
     for sub, is_ok in results:
@@ -308,29 +313,32 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
         await query.edit_message_text(msg_text, disable_web_page_preview=True)
         return
 
+    # ✅ Barcha still_incomplete ni belgilash (Instagram ham)
     for sub in still_incomplete:
         await mark_user_completed_sub(user_id, sub["id"])
 
-    await query.edit_message_text("✅ Ajoyib! Barcha kanallarga obuna bo'lgansiz. Botdan foydalanishingiz mumkin!")
+    # ✅ ENG MUHIM: Cache va xabarni tozalash
+    context.user_data.pop("sub_check_cache", None)
+    context.user_data.pop("sub_check_time", None)
+    context.user_data.pop("mandatory_msg_id", None)
 
-    if "mandatory_msg_id" in context.user_data:
-        del context.user_data["mandatory_msg_id"]
+    await query.edit_message_text("✅ Ajoyib! Barcha kanallarga obuna bo'lgansiz. Botdan foydalanishingiz mumkin!")
 
     await start_after_subs(update, context)
 
 
 async def start_after_subs(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
-    if update.callback_query:
-        message = update.callback_query.message
-    else:
-        message = update.message
 
-    await message.reply_text(
-        "🎬 Kino botiga xush kelibsiz!\n"
-        "📣 Kino kanalimiz: @kino_bori\n\n"
-        "Film kodini raqamlarda botga yuboring.\n"
-        "Admin: /admin"
+    # ✅ Har doim to'g'ridan-to'g'ri chatga yuboramiz
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            "🎬 Kino botiga xush kelibsiz!\n"
+            "📣 Kino kanalimiz: @kino_bori\n\n"
+            "Film kodini raqamlarda botga yuboring.\n"
+            "Admin: /admin"
+        )
     )
     asyncio.create_task(send_ad(context.bot, user_id))
 
@@ -339,7 +347,6 @@ async def start_after_subs(update: Update, context: CallbackContext):
 async def start(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     referral_code = context.args[0] if context.args else None
-    # Middleware allaqachon register_user_start ni chaqirgan, lekin referral code uchun yana chaqiramiz
     await register_user_start(user_id, referral_code)
 
     if await check_and_handle_mandatory_subs(update, context):
@@ -378,7 +385,8 @@ async def admin(update: Update, context: CallbackContext):
         "<b>Misollar:</b>\n"
         "/add_mandatory telegram @kino_kanal 5000\n"
         "/add_mandatory invite https://t.me/+abc 1000 -1001234567890\n"
-        "/add_mandatory bot @kinobot 3000\n\n"
+        "/add_mandatory bot @kinobot 3000\n"
+        "/add_mandatory instagram https://instagram.com/your_page 5000\n\n"
         "/remove_mandatory &lt;id&gt; - o'chirish\n"
         "/list_mandatory - ro'yxat",
         parse_mode="HTML",
@@ -658,7 +666,8 @@ async def add_mandatory(update: Update, context: CallbackContext):
             "Masalan:\n"
             "/add_mandatory telegram @my_channel 5000\n"
             "/add_mandatory invite https://t.me/+abc123 1000 -1001234567890\n"
-            "/add_mandatory bot @kinobot 3000"
+            "/add_mandatory bot @kinobot 3000\n"
+            "/add_mandatory instagram https://instagram.com/your_page 5000"
         )
         return
 
@@ -720,7 +729,6 @@ async def list_mandatory(update: Update, context: CallbackContext):
 # ======================== Kod yuborish ========================
 async def handle_code(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
-    # Middleware allaqachon register_user_start chaqirgan, lekin aktivlik uchun qo'shimcha
     await update_user_activity(user_id)
 
     if await check_and_handle_mandatory_subs(update, context):
@@ -776,7 +784,7 @@ async def main():
 
     private_filter = filters.ChatType.PRIVATE
 
-    # 🔥 ENG BIRINCHI: Foydalanuvchini kuzatuvchi middleware (group=-1)
+    # 🔥 ENG BIRINCHI: Foydalanuvchini kuzatuvchi middleware
     bot_application.add_handler(
         MessageHandler(filters.ALL, track_user_middleware),
         group=-1
