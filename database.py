@@ -67,7 +67,7 @@ async def init_db():
             )
         ''')
 
-        # ESKI JADVALGA chat_id QO'SHISH
+        # chat_id ustunini qo'shish
         try:
             await conn.execute('''
                 ALTER TABLE mandatory_subscriptions 
@@ -76,6 +76,7 @@ async def init_db():
         except Exception:
             pass
 
+        # ----- Foydalanuvchi bajargan obunalar -----
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS user_completed_subs (
                 user_id BIGINT NOT NULL,
@@ -85,7 +86,7 @@ async def init_db():
             )
         ''')
 
-        # ===== current_count NI HAQIQIY SONGA TENG LASHTIRISH =====
+        # current_count ni haqiqiy songa tenglashtirish
         try:
             await conn.execute('''
                 UPDATE mandatory_subscriptions ms
@@ -119,7 +120,7 @@ async def register_user_start(user_id, referral_code=None):
                 )
 
 
-async def update_user_activity(user_id):
+async def update_last_activity(user_id):
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = $1",
@@ -157,6 +158,14 @@ async def get_all_user_ids():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM users")
         return [r["user_id"] for r in rows]
+
+
+async def get_user_referral_count(user_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referred_by = $1",
+            str(user_id)
+        )
 
 
 # ======================== Videolar ========================
@@ -242,8 +251,6 @@ async def increment_ad_count():
 async def get_active_mandatory_subs():
     """
     BARCHA majburiy obunalarni qaytaradi (is_active dan qat'i nazar).
-    Sabab: is_active=0 faqat YANGI foydalanuvchilar uchun cheklov,
-    lekin ESKI foydalanuvchilar hali ham obuna bo'lishi kerak.
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch('''
@@ -272,26 +279,6 @@ async def get_active_mandatory_subs():
         ]
 
 
-async def get_all_mandatory_subs():
-    """Admin uchun — barcha obunalar (is_active holati bilan)"""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch('''
-            SELECT 
-                ms.id, 
-                ms.type, 
-                ms.identifier, 
-                ms.limit_count, 
-                ms.is_active, 
-                ms.chat_id,
-                COALESCE(COUNT(ucs.user_id), 0) AS current_count
-            FROM mandatory_subscriptions ms
-            LEFT JOIN user_completed_subs ucs ON ucs.sub_id = ms.id
-            GROUP BY ms.id, ms.type, ms.identifier, ms.limit_count, ms.is_active, ms.chat_id
-            ORDER BY ms.id
-        ''')
-        return rows
-
-
 async def is_user_completed_sub(user_id: int, sub_id: int) -> bool:
     async with pool.acquire() as conn:
         row = await conn.fetchval(
@@ -302,38 +289,45 @@ async def is_user_completed_sub(user_id: int, sub_id: int) -> bool:
 
 
 async def mark_user_completed_sub(user_id: int, sub_id: int) -> bool:
-    """
-    ATOMAR: faqat yangi qo'shilganda current_count oshadi.
-    is_active ni O'ZGARTIRMAYDI (chunki eski foydalanuvchilar uchun obuna davom etadi).
-    """
+    """Foydalanuvchi obunani bajardi deb belgilash (atomar)."""
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await conn.execute(
-                "INSERT INTO user_completed_subs (user_id, sub_id) VALUES ($1, $2) "
-                "ON CONFLICT (user_id, sub_id) DO NOTHING",
+            exists = await conn.fetchval(
+                "SELECT 1 FROM user_completed_subs WHERE user_id = $1 AND sub_id = $2",
                 user_id, sub_id
             )
+            if exists:
+                print(f"ℹ️ [DB] Allaqachon mavjud: user={user_id}, sub={sub_id}")
+                return False
 
-            if result == "INSERT 0 1":
-                await conn.execute(
-                    "UPDATE mandatory_subscriptions "
-                    "SET current_count = current_count + 1 WHERE id = $1",
-                    sub_id
-                )
-            return False
+            await conn.execute(
+                "INSERT INTO user_completed_subs (user_id, sub_id) VALUES ($1, $2)",
+                user_id, sub_id
+            )
+            print(f"✅ [DB] Yozildi: user={user_id}, sub={sub_id}")
+
+            await conn.execute(
+                "UPDATE mandatory_subscriptions "
+                "SET current_count = current_count + 1 WHERE id = $1",
+                sub_id
+            )
+            return True
 
 
 async def set_user_completed_sub(user_id: int, sub_id: int, completed: bool = True):
-    """completed=False bo'lsa current_count ham kamayadi (atomar)"""
+    """completed=False bo'lsa current_count ham kamayadi (atomar)."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             if completed:
-                result = await conn.execute(
-                    "INSERT INTO user_completed_subs (user_id, sub_id) VALUES ($1, $2) "
-                    "ON CONFLICT (user_id, sub_id) DO NOTHING",
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM user_completed_subs WHERE user_id = $1 AND sub_id = $2",
                     user_id, sub_id
                 )
-                if result == "INSERT 0 1":
+                if not exists:
+                    await conn.execute(
+                        "INSERT INTO user_completed_subs (user_id, sub_id) VALUES ($1, $2)",
+                        user_id, sub_id
+                    )
                     await conn.execute(
                         "UPDATE mandatory_subscriptions "
                         "SET current_count = current_count + 1 WHERE id = $1",
@@ -369,7 +363,6 @@ async def remove_mandatory_subscription(sub_id: int):
 
 
 async def list_mandatory_subscriptions():
-    """Admin uchun — barcha obunalar ro'yxati"""
     async with pool.acquire() as conn:
         rows = await conn.fetch('''
             SELECT 
