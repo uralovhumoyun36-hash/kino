@@ -3,10 +3,20 @@ from config import DATABASE_URL
 
 pool = None
 
+# ======================== Vaqt zonasi ========================
+TZ = 'Asia/Tashkent'  # O'zbekiston vaqti (UTC+5)
+
 
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=2,                            # doimiy ochiq connectionlar
+        max_size=10,                           # maksimal parallel connection
+        max_inactive_connection_lifetime=300,  # 5 daqiqada bo'sh connectionni yopish
+        command_timeout=30,                    # har query uchun 30s limit
+        timeout=10                             # connection olishga 10s kutish
+    )
 
     async with pool.acquire() as conn:
         # ----- Foydalanuvchilar -----
@@ -67,16 +77,14 @@ async def init_db():
             )
         ''')
 
-        # chat_id ustunini qo'shish
         try:
             await conn.execute('''
                 ALTER TABLE mandatory_subscriptions 
                 ADD COLUMN IF NOT EXISTS chat_id BIGINT
             ''')
-        except Exception:
+        except:
             pass
 
-        # ----- Foydalanuvchi bajargan obunalar -----
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS user_completed_subs (
                 user_id BIGINT NOT NULL,
@@ -86,16 +94,13 @@ async def init_db():
             )
         ''')
 
-        # current_count ni haqiqiy songa tenglashtirish
-        try:
-            await conn.execute('''
-                UPDATE mandatory_subscriptions ms
-                SET current_count = (
-                    SELECT COUNT(*) FROM user_completed_subs ucs WHERE ucs.sub_id = ms.id
-                )
-            ''')
-        except Exception as e:
-            print(f"current_count tuzatishda xatolik: {e}")
+        # ======================== INDEKSLAR (tezlik uchun) ========================
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity DESC)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_first_start ON users(first_start DESC)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_user_completed_subs_user ON user_completed_subs(user_id)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_mandatory_subs_active ON mandatory_subscriptions(is_active, current_count)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_videos_code ON videos(code)')
 
 
 # ======================== Foydalanuvchilar ========================
@@ -120,12 +125,27 @@ async def register_user_start(user_id, referral_code=None):
                 )
 
 
-async def update_last_activity(user_id):
+async def update_last_activity(user_id: int):
+    """Har qanday xabar/komanda kelganda last_activity ni yangilaydi"""
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = $1",
             user_id
         )
+
+
+async def get_user_referral_count(user_id):
+    """Foydalanuvchi qancha odam qo'shganini qaytaradi"""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referred_by = $1::text",
+            str(user_id)
+        )
+        ref_count = await conn.fetchval(
+            "SELECT COALESCE(SUM(count), 0) FROM referrals WHERE code = $1::text",
+            str(user_id)
+        )
+        return count + ref_count
 
 
 async def get_total_users():
@@ -134,23 +154,33 @@ async def get_total_users():
 
 
 async def get_today_users():
+    """Bugun qo'shilganlar (O'zbekiston vaqti bo'yicha)"""
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE DATE(first_start) = CURRENT_DATE"
+            "SELECT COUNT(*) FROM users "
+            "WHERE (first_start AT TIME ZONE 'UTC' AT TIME ZONE $1)::date "
+            "= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AT TIME ZONE $1)::date",
+            TZ
         )
 
 
 async def get_week_users():
+    """Oxirgi 7 kunda qo'shilganlar (O'zbekiston vaqti bo'yicha)"""
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE first_start >= CURRENT_DATE - INTERVAL '7 days'"
+            "SELECT COUNT(*) FROM users "
+            "WHERE first_start >= "
+            "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AT TIME ZONE $1) - INTERVAL '7 days'",
+            TZ
         )
 
 
 async def get_active_users_last_24h():
+    """Oxirgi 24 soatda faol bo'lganlar"""
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE last_activity >= CURRENT_TIMESTAMP - INTERVAL '1 day'"
+            "SELECT COUNT(*) FROM users "
+            "WHERE last_activity >= CURRENT_TIMESTAMP - INTERVAL '24 hours'"
         )
 
 
@@ -158,14 +188,6 @@ async def get_all_user_ids():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM users")
         return [r["user_id"] for r in rows]
-
-
-async def get_user_referral_count(user_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE referred_by = $1",
-            str(user_id)
-        )
 
 
 # ======================== Videolar ========================
@@ -249,23 +271,14 @@ async def increment_ad_count():
 
 # ======================== Majburiy obuna ========================
 async def get_active_mandatory_subs():
-    """
-    BARCHA majburiy obunalarni qaytaradi (is_active dan qat'i nazar).
-    """
+    """Faqat faol va limiti tugamagan obunalar"""
     async with pool.acquire() as conn:
-        rows = await conn.fetch('''
-            SELECT 
-                ms.id, 
-                ms.type, 
-                ms.identifier, 
-                ms.limit_count,
-                ms.chat_id,
-                COALESCE(COUNT(ucs.user_id), 0) AS current_count
-            FROM mandatory_subscriptions ms
-            LEFT JOIN user_completed_subs ucs ON ucs.sub_id = ms.id
-            GROUP BY ms.id, ms.type, ms.identifier, ms.limit_count, ms.chat_id
-            ORDER BY ms.id
-        ''')
+        rows = await conn.fetch(
+            "SELECT id, type, identifier, limit_count, current_count, chat_id "
+            "FROM mandatory_subscriptions "
+            "WHERE is_active = 1 AND current_count < limit_count "
+            "ORDER BY id"
+        )
         return [
             {
                 "id": r["id"],
@@ -289,93 +302,77 @@ async def is_user_completed_sub(user_id: int, sub_id: int) -> bool:
 
 
 async def mark_user_completed_sub(user_id: int, sub_id: int) -> bool:
-    """Foydalanuvchi obunani bajardi deb belgilash (atomar)."""
     async with pool.acquire() as conn:
         async with conn.transaction():
-            exists = await conn.fetchval(
+            existing = await conn.fetchval(
                 "SELECT 1 FROM user_completed_subs WHERE user_id = $1 AND sub_id = $2",
                 user_id, sub_id
             )
-            if exists:
-                print(f"ℹ️ [DB] Allaqachon mavjud: user={user_id}, sub={sub_id}")
+            if existing:
                 return False
 
             await conn.execute(
                 "INSERT INTO user_completed_subs (user_id, sub_id) VALUES ($1, $2)",
                 user_id, sub_id
             )
-            print(f"✅ [DB] Yozildi: user={user_id}, sub={sub_id}")
-
             await conn.execute(
-                "UPDATE mandatory_subscriptions "
-                "SET current_count = current_count + 1 WHERE id = $1",
+                "UPDATE mandatory_subscriptions SET current_count = current_count + 1 WHERE id = $1",
                 sub_id
             )
-            return True
+
+            row = await conn.fetchrow(
+                "SELECT current_count, limit_count FROM mandatory_subscriptions WHERE id = $1",
+                sub_id
+            )
+            if row and row["current_count"] >= row["limit_count"]:
+                await conn.execute(
+                    "UPDATE mandatory_subscriptions SET is_active = 0 WHERE id = $1",
+                    sub_id
+                )
+                return True
+            return False
 
 
 async def set_user_completed_sub(user_id: int, sub_id: int, completed: bool = True):
-    """completed=False bo'lsa current_count ham kamayadi (atomar)."""
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            if completed:
-                exists = await conn.fetchval(
-                    "SELECT 1 FROM user_completed_subs WHERE user_id = $1 AND sub_id = $2",
-                    user_id, sub_id
-                )
-                if not exists:
-                    await conn.execute(
-                        "INSERT INTO user_completed_subs (user_id, sub_id) VALUES ($1, $2)",
-                        user_id, sub_id
-                    )
-                    await conn.execute(
-                        "UPDATE mandatory_subscriptions "
-                        "SET current_count = current_count + 1 WHERE id = $1",
-                        sub_id
-                    )
-            else:
-                result = await conn.execute(
-                    "DELETE FROM user_completed_subs WHERE user_id = $1 AND sub_id = $2",
-                    user_id, sub_id
-                )
-                if result == "DELETE 1":
-                    await conn.execute(
-                        "UPDATE mandatory_subscriptions "
-                        "SET current_count = GREATEST(current_count - 1, 0) WHERE id = $1",
-                        sub_id
-                    )
+        if completed:
+            await conn.execute(
+                "INSERT INTO user_completed_subs (user_id, sub_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                user_id, sub_id
+            )
+        else:
+            await conn.execute(
+                "DELETE FROM user_completed_subs WHERE user_id = $1 AND sub_id = $2",
+                user_id, sub_id
+            )
 
 
 async def add_mandatory_subscription(sub_type: str, identifier: str, limit_count: int, chat_id: int = None):
+    """Bir xil identifier mavjud bo'lsa, qayta qo'shmaydi."""
     async with pool.acquire() as conn:
-        await conn.execute(
+        existing = await conn.fetchval(
+            "SELECT id FROM mandatory_subscriptions WHERE identifier = $1",
+            identifier
+        )
+        if existing:
+            return existing
+        return await conn.fetchval(
             "INSERT INTO mandatory_subscriptions (type, identifier, limit_count, chat_id) "
-            "VALUES ($1, $2, $3, $4)",
+            "VALUES ($1, $2, $3, $4) RETURNING id",
             sub_type, identifier, limit_count, chat_id
         )
 
 
 async def remove_mandatory_subscription(sub_id: int):
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("DELETE FROM user_completed_subs WHERE sub_id = $1", sub_id)
-            await conn.execute("DELETE FROM mandatory_subscriptions WHERE id = $1", sub_id)
+        await conn.execute("DELETE FROM mandatory_subscriptions WHERE id = $1", sub_id)
+        await conn.execute("DELETE FROM user_completed_subs WHERE sub_id = $1", sub_id)
 
 
 async def list_mandatory_subscriptions():
     async with pool.acquire() as conn:
-        rows = await conn.fetch('''
-            SELECT 
-                ms.id, 
-                ms.type, 
-                ms.identifier, 
-                ms.limit_count, 
-                ms.is_active, 
-                ms.chat_id,
-                COALESCE(COUNT(ucs.user_id), 0) AS current_count
-            FROM mandatory_subscriptions ms
-            LEFT JOIN user_completed_subs ucs ON ucs.sub_id = ms.id
-            GROUP BY ms.id, ms.type, ms.identifier, ms.limit_count, ms.is_active, ms.chat_id
-            ORDER BY ms.id
-        ''')
+        rows = await conn.fetch(
+            "SELECT id, type, identifier, limit_count, current_count, is_active, chat_id "
+            "FROM mandatory_subscriptions ORDER BY id"
+        )
         return rows
